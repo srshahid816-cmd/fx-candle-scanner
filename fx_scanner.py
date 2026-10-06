@@ -69,7 +69,8 @@ PAIRS = [
 INTERVAL_SEC = {"1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800, "60m": 3600, "1h": 3600}
 # Yahoo ki intraday limits (din)
 MAX_DAYS = {"1m": 29, "2m": 59, "5m": 59, "15m": 59, "30m": 59, "60m": 729, "1h": 729}
-DEFAULT_DAYS = {"1m": 14, "2m": 30, "5m": 59, "15m": 59, "30m": 59, "60m": 365, "1h": 365}
+ROUND_STEP = {"1m": 10, "2m": 10, "5m": 25, "15m": 50, "30m": 50, "60m": 100, "1h": 100}  # points (1 pip = 10 points)
+DEFAULT_DAYS = {"1m": 29, "2m": 30, "5m": 59, "15m": 59, "30m": 59, "60m": 365, "1h": 365}
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ class Params:
     round_step_pts: int = 50     # round-number level har itne "points" par (1 pip = 10 points)
     tol_atr: float = 0.15        # "touch" tolerance (ATR ke hisaab se)
     near_target_atr: float = 1.0 # target itna paas ho to reversal nahi
-    min_score: float = 1.5       # BUY/SELL ke liye minimum score
+    min_score: float = 1.0       # BUY/SELL ke liye minimum score (1.0 = koi bhi ek trend-aligned module)
     train_frac: float = 0.70     # train / test split
     min_n_tune: int = 30         # tuning mein minimum trades
     low_vol_ratio: float = 0.5   # ATR is se kam (median ka) to market "dead"
@@ -385,7 +386,7 @@ def stats(sig, d, sl=None, payout=0.85):
 def tune_params(df, sym, P, payout):
     split = int(len(df) * P.train_frac)
     best_key, best_P = -1.0, P
-    for sb, rs, ms in product((0.45, 0.55, 0.65), (25, 50, 100), (1.0, 1.5, 2.0)):
+    for sb, rs, ms in product((0.45, 0.55, 0.65), (5, 10, 25, 50), (0.5, 1.0, 1.5)):
         Pt = replace(P, strong_body=sb, round_step_pts=rs, min_score=ms)
         d, _, score = build(df, sym, Pt)
         st = stats(decide(score, ms), d, slice(0, split), payout)
@@ -468,6 +469,34 @@ def analyze(name, df, P, payout, gate, tune=False):
 # --------------------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------------------
+
+def pool_stats(stat_list, payout):
+    n = sum(x["n"] for x in stat_list)
+    w = sum(x["w"] for x in stat_list)
+    wr = w / n if n else float("nan")
+    lb, ub = wilson(w, n)
+    ev = wr * payout - (1 - wr) if n else float("nan")
+    return {"n": n, "w": w, "wr": wr, "lb": lb, "ub": ub, "ev": ev}
+
+
+def print_pooled(ok, payout):
+    if len(ok) < 2:
+        return
+    be = 1.0 / (1.0 + payout)
+    print(f"\n=== POOLED: {len(ok)} pairs ek saath (breakeven {pct(be)}) ===")
+    rows = [("COMBINED all", pool_stats([r["all"] for r in ok], payout)),
+            ("COMBINED OOS", pool_stats([r["test"] for r in ok], payout))]
+    names = [m[0] for m in ok[0]["mods"]]
+    for i, nm in enumerate(names):
+        rows.append((f"{nm} all", pool_stats([r["mods"][i][1] for r in ok], payout)))
+        rows.append((f"{nm} OOS", pool_stats([r["mods"][i][2] for r in ok], payout)))
+    for lbl, s_ in rows:
+        flag = ""
+        if s_["n"] >= 300:
+            flag = "  <-- EDGE" if s_["lb"] > be else ("  (point>BE, CI nahi)" if s_["wr"] > be else "")
+        print(f"{lbl:18} n={s_['n']:6d} win={pct(s_['wr']):>6} CI=[{pct(s_['lb'])}, {pct(s_['ub'])}] EV/1unit={s_['ev']:+.3f}{flag}")
+
+
 def color_of(a):
     return {"BUY": "green", "SELL": "red", "HOLD": "yellow"}.get(a, "white")
 
@@ -515,6 +544,7 @@ def print_results(results, args, interval):
                 s = r[key]
                 print(f"{lbl:20} n={s['n']:4d} win={pct(s['wr']):>6} CI=[{pct(s['lb'])}, {pct(s['ub'])}] EV/1unit={s['ev']:+.3f}")
 
+    print_pooled(ok, args.payout)
     print("\nNOTE: Win% = is rule ka PURANA hit-rate (agli candle ki direction) is pair ke data par. Ye guarantee ya prediction nahi.")
     print(f"      Breakeven {pct(be)}; usse neeche = paisa jata hai. ACTION = SIGNAL jab out-of-sample win% breakeven se upar ho (gate={args.gate}), warna HOLD.")
 
@@ -586,12 +616,13 @@ def main():
     ap = argparse.ArgumentParser(description="FX candle scanner: BUY / SELL / HOLD + historical win%")
     ap.add_argument("--pairs", nargs="+", help="e.g. EURUSD GBPJPY")
     ap.add_argument("--all", action="store_true", help="sab 28 major/minor pairs")
-    ap.add_argument("--interval", default="5m", choices=list(INTERVAL_SEC.keys()))
+    ap.add_argument("--interval", default="1m", choices=list(INTERVAL_SEC.keys()))
     ap.add_argument("--days", type=int, default=None, help="kitne din ka data (default timeframe ke hisaab se)")
     ap.add_argument("--payout", type=float, default=0.85, help="binary payout, 0.85 = 85%%")
     ap.add_argument("--min-score", type=float, default=Params.min_score)
     ap.add_argument("--gate", choices=["none", "point", "ci"], default="point",
                     help="ACTION kab BUY/SELL ho: none = hamesha signal, point = OOS win%% > breakeven, ci = OOS CI low > breakeven")
+    ap.add_argument("--round-step", type=int, default=None, help="round-number level gap, points mein (default timeframe ke hisaab se)")
     ap.add_argument("--tune", action="store_true", help="parameters train data par tune karo (overfit ka khatra, OOS dekho)")
     ap.add_argument("--detail", action="store_true", help="module-wise stats")
     ap.add_argument("--csv", help="TradingView export CSV (is mode mein --name zaroor do)")
@@ -604,7 +635,7 @@ def main():
         ap.error("--payout 0.0-1.5 ke beech")
     interval = args.interval
     days = args.days or DEFAULT_DAYS.get(interval, 30)
-    P = replace(Params(), min_score=args.min_score)
+    P = replace(Params(), min_score=args.min_score, round_step_pts=args.round_step or ROUND_STEP.get(interval, 50))
 
     if args.csv:
         pairs = [normalize_symbol(args.name or "CSVPAIR")]
@@ -621,6 +652,7 @@ def main():
     if not pairs:
         print("Koi pair select nahi hua.")
         return
+    P = replace(P, round_step_pts=args.round_step or ROUND_STEP.get(interval, 50))
 
     if not args.watch:
         run_scan(pairs, args, interval, days, P)
